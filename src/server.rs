@@ -17,26 +17,30 @@ pub struct Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
-            server_info: None,
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
-                // diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                //     DiagnosticOptions {
-                //         identifier: Some("bazel-lsp".to_string()),
-                //         inter_file_dependencies: false,
-                //         workspace_diagnostics: false,
-                //         work_done_progress_options: WorkDoneProgressOptions {
-                //             work_done_progress: Some(false),
-                //         },
-                //     },
-                // )),
-                ..ServerCapabilities::default()
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![
+                        "bazel.build".into(),
+                        "bazel.test".into(),
+                        "bazel.run".into(),
+                        "bazel.execute".into(),
+                    ],
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                }),
+                ..Default::default()
             },
+            server_info: Some(ServerInfo {
+                name: "bazel-lsp".into(),
+                version: Some("0.1.0".into()),
+            }),
         })
     }
 
@@ -86,23 +90,40 @@ impl LanguageServer for Backend {
         match self.parser.extract_targets(&text) {
             Ok(targets) => {
                 for target in targets {
-                    let command = match target.rule_type.as_str() {
-                        rule if rule.ends_with("_test") => "bazel.test",
-                        rule if rule.ends_with("_binary") => "bazel.run",
-                        _ => "bazel.build",
-                    };
-
-                    let title = match command {
-                        "bazel.test" => format!("Run {}", target.name),
-                        "bazel.run" => format!("Run {}", target.name),
-                        _ => format!("Build {}", target.name),
-                    };
-
+                    match target.rule_type.as_str() {
+                        rule if rule.ends_with("_test") => {
+                            lenses.push(CodeLens {
+                                range: target.range.clone(),
+                                command: Some(Command {
+                                    title: format!("Test {}", target.name),
+                                    command: "bazel.test".into(),
+                                    arguments: Some(vec![serde_json::json!({
+                                        "target": target.name
+                                    })]),
+                                }),
+                                data: None,
+                            });
+                        }
+                        rule if rule.ends_with("_binary") => {
+                            lenses.push(CodeLens {
+                                range: target.range.clone(),
+                                command: Some(Command {
+                                    title: format!("▶ Run {}", target.name),
+                                    command: "bazel.run".into(),
+                                    arguments: Some(vec![serde_json::json!({
+                                        "target": target.name
+                                    })]),
+                                }),
+                                data: None,
+                            });
+                        }
+                        _ => {}
+                    }
                     lenses.push(CodeLens {
                         range: target.range,
                         command: Some(Command {
-                            title,
-                            command: command.into(),
+                            title: format!("Build {}", target.name),
+                            command: "bazel.build".into(),
                             arguments: Some(vec![serde_json::json!({
                                 "target": target.name
                             })]),
