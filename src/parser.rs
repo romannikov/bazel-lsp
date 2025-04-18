@@ -11,9 +11,21 @@ pub struct BazelTarget {
     pub range: Range,
 }
 
+#[derive(Debug, Clone)]
+pub struct BazelAttribute {
+    pub range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct BazelString {
+    pub range: Range,
+}
+
 pub struct BazelParser {
     parser: Mutex<Parser>,
-    query: Query,
+    target_query: Query,
+    attribute_query: Query,
+    string_query: Query,
 }
 
 impl BazelParser {
@@ -24,7 +36,7 @@ impl BazelParser {
             .set_language(&language.into())
             .expect("Error loading Starlark parser");
 
-        let query = Query::new(
+        let target_query = Query::new(
             &language.into(),
             r#"
             (call
@@ -39,9 +51,27 @@ impl BazelParser {
             "#,
         )?;
 
+        let attribute_query = Query::new(
+            &language.into(),
+            r#"
+            (keyword_argument
+                name: (identifier) @attr_name
+            )
+            "#,
+        )?;
+
+        let string_query = Query::new(
+            &language.into(),
+            r#"
+            (string) @string
+            "#,
+        )?;
+
         Ok(Self {
             parser: Mutex::new(parser),
-            query,
+            target_query: target_query,
+            attribute_query: attribute_query,
+            string_query: string_query,
         })
     }
 
@@ -64,7 +94,7 @@ impl BazelParser {
 
         let mut targets = Vec::new();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.query, tree.root_node(), source.as_bytes());
+        let mut matches = cursor.matches(&self.target_query, tree.root_node(), source.as_bytes());
 
         while let Some(m) = matches.next() {
             let mut rule_type = String::new();
@@ -116,6 +146,77 @@ impl BazelParser {
         }
 
         Ok(targets)
+    }
+
+    pub fn extract_attributes(&self, source: &str) -> Result<Vec<BazelAttribute>> {
+        let tree = self
+            .parser
+            .lock()
+            .unwrap()
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse BUILD file"))?;
+
+        let mut attributes = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches =
+            cursor.matches(&self.attribute_query, tree.root_node(), source.as_bytes());
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let node = capture.node;
+                let text = &source[node.start_byte()..node.end_byte()];
+
+                attributes.push(BazelAttribute {
+                    range: Range {
+                        start: Position {
+                            line: node.start_position().row as u32,
+                            character: node.start_position().column as u32,
+                        },
+                        end: Position {
+                            line: node.end_position().row as u32,
+                            character: node.end_position().column as u32,
+                        },
+                    },
+                });
+            }
+        }
+
+        Ok(attributes)
+    }
+
+    pub fn extract_strings(&self, source: &str) -> Result<Vec<BazelString>> {
+        let tree = self
+            .parser
+            .lock()
+            .unwrap()
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse BUILD file"))?;
+
+        let mut strings = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.string_query, tree.root_node(), source.as_bytes());
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let node = capture.node;
+                let text = &source[node.start_byte()..node.end_byte()];
+
+                strings.push(BazelString {
+                    range: Range {
+                        start: Position {
+                            line: node.start_position().row as u32,
+                            character: node.start_position().column as u32,
+                        },
+                        end: Position {
+                            line: node.end_position().row as u32,
+                            character: node.end_position().column as u32,
+                        },
+                    },
+                });
+            }
+        }
+
+        Ok(strings)
     }
 }
 

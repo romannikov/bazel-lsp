@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::SemanticTokensOptions;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use url;
@@ -24,6 +25,25 @@ impl LanguageServer for Backend {
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions {
+                                work_done_progress: Some(true),
+                            },
+                            legend: SemanticTokensLegend {
+                                token_types: vec![
+                                    SemanticTokenType::new("function"),
+                                    SemanticTokenType::new("property"),
+                                    SemanticTokenType::new("string"),
+                                ],
+                                token_modifiers: vec![],
+                            },
+                            range: Some(true),
+                            full: None,
+                        },
+                    ),
+                ),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
                         "bazel.build".into(),
@@ -177,6 +197,30 @@ impl LanguageServer for Backend {
             data: lens.data,
         })
     }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri.clone();
+        let documents = self.documents.read().await;
+        let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
+
+        let tokens = self.get_semantic_tokens(&text);
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri.clone();
+        let documents = self.documents.read().await;
+        let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
+
+        let tokens = self.get_semantic_tokens(&text);
+        Ok(Some(SemanticTokensRangeResult::Tokens(tokens)))
+    }
 }
 
 impl Backend {
@@ -278,5 +322,89 @@ impl Backend {
         }
 
         byte_index
+    }
+
+    pub fn get_semantic_tokens(&self, text: &str) -> SemanticTokens {
+        let mut tokens = Vec::new();
+
+        let targets = match self.parser.extract_targets(text) {
+            Ok(targets) => targets,
+            Err(_) => Vec::new(),
+        };
+
+        let attributes = match self.parser.extract_attributes(text) {
+            Ok(attributes) => attributes,
+            Err(_) => Vec::new(),
+        };
+
+        let strings = match self.parser.extract_strings(text) {
+            Ok(strings) => strings,
+            Err(_) => Vec::new(),
+        };
+
+        let mut all_tokens: Vec<(Range, u32)> = Vec::new();
+
+        for target in targets {
+            all_tokens.push((target.range, 0));
+        }
+
+        for attr in attributes {
+            all_tokens.push((attr.range, 1));
+        }
+
+        for string in strings {
+            all_tokens.push((string.range, 2));
+        }
+
+        all_tokens.sort_by(|a, b| {
+            let line_cmp = a.0.start.line.cmp(&b.0.start.line);
+            if line_cmp == std::cmp::Ordering::Equal {
+                a.0.start.character.cmp(&b.0.start.character)
+            } else {
+                line_cmp
+            }
+        });
+
+        let mut prev_line = 0;
+        let mut prev_start = 0;
+
+        for (range, token_type) in all_tokens {
+            let delta_line = range.start.line;
+            let delta_start = if delta_line == prev_line {
+                if range.start.character >= prev_start {
+                    range.start.character - prev_start
+                } else {
+                    0
+                }
+            } else {
+                range.start.character
+            };
+
+            let delta_line_value = if tokens.is_empty() {
+                delta_line
+            } else {
+                if delta_line >= prev_line {
+                    delta_line - prev_line
+                } else {
+                    0
+                }
+            };
+
+            tokens.push(SemanticToken {
+                delta_line: delta_line_value,
+                delta_start: delta_start as u32,
+                length: (range.end.character - range.start.character) as u32,
+                token_type,
+                token_modifiers_bitset: 0,
+            });
+
+            prev_line = delta_line;
+            prev_start = range.start.character;
+        }
+
+        SemanticTokens {
+            result_id: None,
+            data: tokens,
+        }
     }
 }
