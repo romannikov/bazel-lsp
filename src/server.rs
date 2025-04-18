@@ -22,7 +22,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
                 code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: Some(false),
+                    resolve_provider: Some(true),
                 }),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
@@ -58,7 +58,6 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.clone();
         let text = params.text_document.text.clone();
 
-        // Store the document text
         let mut documents = self.documents.write().await;
         documents.insert(uri.to_string(), text.clone());
 
@@ -70,13 +69,16 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let text = params.content_changes[0].text.clone();
 
-        // Update the stored document text
-        let mut documents = self.documents.write().await;
-        documents.insert(uri.to_string(), text.clone());
+        // self.publish_diagnostics(&uri, &text).await;
 
-        self.publish_diagnostics(&uri, &text).await;
+        self.update_document_content(&uri, &params.content_changes)
+            .await;
+
+        self.client
+            .send_request::<request::CodeLensRefresh>(())
+            .await
+            .ok();
     }
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
@@ -94,41 +96,35 @@ impl LanguageServer for Backend {
                         rule if rule.ends_with("_test") => {
                             lenses.push(CodeLens {
                                 range: target.range.clone(),
-                                command: Some(Command {
-                                    title: format!("Test {}", target.name),
-                                    command: "bazel.test".into(),
-                                    arguments: Some(vec![serde_json::json!({
-                                        "target": target.name
-                                    })]),
-                                }),
-                                data: None,
+                                command: None,
+                                data: Some(serde_json::json!({
+                                    "type": "test",
+                                    "target": target.name,
+                                    "rule_type": target.rule_type,
+                                })),
                             });
                         }
                         rule if rule.ends_with("_binary") => {
                             lenses.push(CodeLens {
                                 range: target.range.clone(),
-                                command: Some(Command {
-                                    title: format!("▶ Run {}", target.name),
-                                    command: "bazel.run".into(),
-                                    arguments: Some(vec![serde_json::json!({
-                                        "target": target.name
-                                    })]),
-                                }),
-                                data: None,
+                                command: None,
+                                data: Some(serde_json::json!({
+                                    "type": "run",
+                                    "target": target.name,
+                                    "rule_type": target.rule_type,
+                                })),
                             });
                         }
                         _ => {}
                     }
                     lenses.push(CodeLens {
                         range: target.range,
-                        command: Some(Command {
-                            title: format!("Build {}", target.name),
-                            command: "bazel.build".into(),
-                            arguments: Some(vec![serde_json::json!({
-                                "target": target.name
-                            })]),
-                        }),
-                        data: None,
+                        command: None,
+                        data: Some(serde_json::json!({
+                            "type": "build",
+                            "target": target.name,
+                            "rule_type": target.rule_type,
+                        })),
                     });
                 }
             }
@@ -143,6 +139,43 @@ impl LanguageServer for Backend {
         }
 
         Ok(Some(lenses))
+    }
+
+    async fn code_lens_resolve(&self, lens: CodeLens) -> Result<CodeLens> {
+        let data = lens.data.clone().unwrap();
+        let lens_type = data["type"].as_str().unwrap();
+        let target = data["target"].as_str().unwrap();
+
+        let command = match lens_type {
+            "run" => Command {
+                title: format!("▶ Run {}", target),
+                command: "bazel.run".into(),
+                arguments: Some(vec![serde_json::json!({
+                    "target": target
+                })]),
+            },
+            "test" => Command {
+                title: format!("Test {}", target),
+                command: "bazel.test".into(),
+                arguments: Some(vec![serde_json::json!({
+                    "target": target
+                })]),
+            },
+            "build" => Command {
+                title: format!("Build {}", target),
+                command: "bazel.build".into(),
+                arguments: Some(vec![serde_json::json!({
+                    "target": target
+                })]),
+            },
+            _ => panic!("Unknown lens type: {}", lens_type),
+        };
+
+        Ok(CodeLens {
+            range: lens.range,
+            command: Some(command),
+            data: lens.data,
+        })
     }
 }
 
@@ -192,5 +225,58 @@ impl Backend {
                     .await;
             }
         }
+    }
+
+    pub async fn update_document_content(
+        &self,
+        uri: &url::Url,
+        content_changes: &[TextDocumentContentChangeEvent],
+    ) {
+        let mut documents = self.documents.write().await;
+        let current_text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
+
+        let mut new_text = current_text;
+        for change in content_changes {
+            if let Some(range) = &change.range {
+                let start_byte = self.position_to_byte_index(&new_text, &range.start);
+                let end_byte = self.position_to_byte_index(&new_text, &range.end);
+
+                new_text.replace_range(start_byte..end_byte, &change.text);
+            } else {
+                new_text = change.text.clone();
+            }
+        }
+
+        documents.insert(uri.to_string(), new_text);
+    }
+
+    fn position_to_byte_index(&self, text: &str, position: &Position) -> usize {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut byte_index = 0;
+
+        for i in 0..position.line as usize {
+            if i < lines.len() {
+                byte_index += lines[i].len() + 1; // +1 for the newline character
+            }
+        }
+
+        if (position.line as usize) < lines.len() {
+            let line = lines[position.line as usize];
+            let char_index = position.character as usize;
+            let mut chars = 0;
+            let mut bytes = 0;
+
+            for c in line.chars() {
+                if chars >= char_index {
+                    break;
+                }
+                bytes += c.len_utf8();
+                chars += 1;
+            }
+
+            byte_index += bytes;
+        }
+
+        byte_index
     }
 }
