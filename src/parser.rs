@@ -90,7 +90,7 @@ impl BazelParser {
                     2 => {
                         // target_name (if present)
                         if text.starts_with('"') && text.ends_with('"') {
-                            target_name = format!("{}_target", &text[1..text.len() - 1]);
+                            target_name = text[1..text.len() - 1].to_string();
                         }
                     }
                     _ => {}

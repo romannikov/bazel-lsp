@@ -96,34 +96,6 @@ cc_binary(
 }
 
 #[test]
-fn test_target_name_format() -> Result<()> {
-    let parser = BazelParser::default();
-
-    let build_file = r#"
-cc_binary(
-    name = "hello_world",
-    srcs = ["hello_world.cc"],
-)
-"#;
-
-    let targets = parser.extract_targets(build_file)?;
-
-    assert!(
-        !targets.is_empty(),
-        "No targets were extracted from the BUILD file"
-    );
-
-    let target = &targets[0];
-
-    assert!(
-        target.name.ends_with("_target"),
-        "Target name should end with '_target'"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn test_code_lens_command_types() -> Result<()> {
     let parser = BazelParser::default();
 
@@ -261,6 +233,129 @@ py_library(
     assert!(has_run_lens, "No run code lens found");
     assert!(has_test_lens, "No test code lens found");
     assert!(has_build_lens, "No build code lens found");
+
+    Ok(())
+}
+
+#[test]
+fn test_code_lens_target_names() -> Result<()> {
+    let parser = BazelParser::default();
+
+    let build_file = r#"
+cc_binary(
+    name = "hello_world",
+    srcs = ["hello_world.cc"],
+)
+
+go_test(
+    name = "go_test",
+    srcs = ["main_test.go"],
+)
+
+py_library(
+    name = "python_lib",
+    srcs = ["lib.py"],
+)
+"#;
+
+    let targets = parser.extract_targets(build_file)?;
+    assert!(
+        !targets.is_empty(),
+        "No targets were extracted from the BUILD file"
+    );
+
+    let expected_targets = vec![
+        ("hello_world", "cc_binary"),
+        ("go_test", "go_test"),
+        ("python_lib", "py_library"),
+    ];
+
+    for (target, (expected_name, expected_type)) in targets.iter().zip(expected_targets.iter()) {
+        let build_lens = CodeLens {
+            range: target.range.clone(),
+            command: Some(Command {
+                title: format!("Build {}", target.name),
+                command: "bazel.build".into(),
+                arguments: Some(vec![serde_json::json!({
+                    "target": target.name
+                })]),
+            }),
+            data: None,
+        };
+
+        let command = build_lens.command.as_ref().unwrap();
+        let target_name = command.arguments.as_ref().unwrap()[0]["target"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(
+            target_name, *expected_name,
+            "Target name '{}' should match expected name '{}'",
+            target_name, expected_name
+        );
+
+        assert_eq!(
+            target.rule_type, *expected_type,
+            "Rule type '{}' should match expected type '{}'",
+            target.rule_type, expected_type
+        );
+
+        match target.rule_type.as_str() {
+            rule if rule.ends_with("_binary") => {
+                let run_lens = CodeLens {
+                    range: target.range.clone(),
+                    command: Some(Command {
+                        title: format!("▶ Run {}", target.name),
+                        command: "bazel.run".into(),
+                        arguments: Some(vec![serde_json::json!({
+                            "target": target.name
+                        })]),
+                    }),
+                    data: None,
+                };
+                let run_target = run_lens
+                    .command
+                    .as_ref()
+                    .unwrap()
+                    .arguments
+                    .as_ref()
+                    .unwrap()[0]["target"]
+                    .as_str()
+                    .unwrap();
+                assert_eq!(
+                    run_target, *expected_name,
+                    "Run lens target name should match expected name"
+                );
+            }
+            rule if rule.ends_with("_test") => {
+                let test_lens = CodeLens {
+                    range: target.range.clone(),
+                    command: Some(Command {
+                        title: format!("Test {}", target.name),
+                        command: "bazel.test".into(),
+                        arguments: Some(vec![serde_json::json!({
+                            "target": target.name
+                        })]),
+                    }),
+                    data: None,
+                };
+                let test_target = test_lens
+                    .command
+                    .as_ref()
+                    .unwrap()
+                    .arguments
+                    .as_ref()
+                    .unwrap()[0]["target"]
+                    .as_str()
+                    .unwrap();
+                assert_eq!(
+                    test_target, *expected_name,
+                    "Test lens target name should match expected name"
+                );
+            }
+            _ => {}
+        }
+    }
 
     Ok(())
 }
