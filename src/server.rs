@@ -90,11 +90,18 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
 
-        // self.publish_diagnostics(&uri, &text).await;
-
         self.update_document_content(&uri, &params.content_changes)
             .await;
 
+        let documents = self.documents.read().await;
+        let text = documents.get(uri.as_str()).cloned().unwrap_or_default();
+
+        self.publish_diagnostics(&uri, &text).await;
+
+        self.client
+            .send_request::<request::SemanticTokensRefresh>(())
+            .await
+            .ok();
         self.client
             .send_request::<request::CodeLensRefresh>(())
             .await

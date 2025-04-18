@@ -164,7 +164,6 @@ impl BazelParser {
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node;
-                let text = &source[node.start_byte()..node.end_byte()];
 
                 attributes.push(BazelAttribute {
                     range: Range {
@@ -199,7 +198,6 @@ impl BazelParser {
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node;
-                let text = &source[node.start_byte()..node.end_byte()];
 
                 strings.push(BazelString {
                     range: Range {
