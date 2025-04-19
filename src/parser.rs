@@ -26,6 +26,7 @@ pub struct BazelParser {
     target_query: Query,
     attribute_query: Query,
     string_query: Query,
+    deps_query: Query,
 }
 
 impl BazelParser {
@@ -67,11 +68,23 @@ impl BazelParser {
             "#,
         )?;
 
+        let deps_query = Query::new(
+            &language.into(),
+            r#"
+            (keyword_argument
+                name: (identifier) @attr_name
+                (#eq? @attr_name "deps")
+                value: (list) @deps_list
+            ) @deps_arg
+            "#,
+        )?;
+
         Ok(Self {
             parser: Mutex::new(parser),
             target_query: target_query,
             attribute_query: attribute_query,
             string_query: string_query,
+            deps_query: deps_query,
         })
     }
 
@@ -233,6 +246,138 @@ impl BazelParser {
         }
 
         Ok(strings)
+    }
+
+    pub fn sort_deps_in_text(&self, source: &str) -> Result<String> {
+        let tree = self
+            .parser
+            .lock()
+            .unwrap()
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse BUILD file"))?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.deps_query, tree.root_node(), source.as_bytes());
+
+        let mut result = source.to_string();
+        let mut changes = Vec::new();
+
+        while let Some(m) = matches.next() {
+            let mut deps: Vec<(String, String)> = Vec::new();
+            let mut deps_range = None;
+
+            for capture in m.captures {
+                let node = capture.node;
+                let text = &source[node.start_byte()..node.end_byte()];
+
+                match capture.index {
+                    0 => {
+                        // This is the attr_name capture
+                        continue;
+                    }
+                    1 => {
+                        // This is the deps_list capture
+                        let list_text = text.trim();
+                        if list_text.starts_with('[') && list_text.ends_with(']') {
+                            let content = &list_text[1..list_text.len() - 1];
+                            for line in content.lines() {
+                                let line = line.trim();
+                                if line.is_empty() || line == "," {
+                                    continue;
+                                }
+
+                                let dep_line = line.trim_end_matches(',').trim().to_string();
+                                if dep_line.starts_with('"') {
+                                    let mut dep = dep_line.clone();
+                                    if let Some(comment_start) = dep_line.find('#') {
+                                        dep = dep_line[..comment_start].trim().to_string();
+                                    }
+                                    if dep.starts_with('"') && dep.ends_with('"') {
+                                        let dep_name = dep[1..dep.len() - 1].to_string();
+                                        // Keep the first occurrence of each dependency with its comment
+                                        if !deps.iter().any(|(name, _)| name == &dep_name) {
+                                            deps.push((dep_name, dep_line));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    2 => {
+                        // This is the deps_arg capture (the entire keyword_argument node)
+                        deps_range = Some(Range {
+                            start: Position {
+                                line: node.start_position().row as u32,
+                                character: node.start_position().column as u32,
+                            },
+                            end: Position {
+                                line: node.end_position().row as u32,
+                                character: node.end_position().column as u32,
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(range) = deps_range {
+                // Sort dependencies
+                deps.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let formatted_deps = if deps.is_empty() {
+                    "deps = []".to_string()
+                } else {
+                    let sorted_lines: Vec<String> =
+                        deps.iter().map(|(_, line)| line.clone()).collect();
+                    format!(
+                        "deps = [\n        {}\n    ]",
+                        sorted_lines.join(",\n        ") + ","
+                    )
+                };
+
+                let start = self.position_to_byte_index(&result, &range.start);
+                let end = self.position_to_byte_index(&result, &range.end);
+                changes.push((start, end, formatted_deps));
+            }
+        }
+
+        // Apply changes in reverse order to maintain correct indices
+        changes.sort_by(|a, b| b.0.cmp(&a.0));
+        for (start, end, formatted_deps) in changes {
+            result.replace_range(start..end, &formatted_deps);
+        }
+
+        Ok(result)
+    }
+
+    fn position_to_byte_index(&self, text: &str, position: &Position) -> usize {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut byte_index = 0;
+
+        for i in 0..position.line as usize {
+            if i < lines.len() {
+                byte_index += lines[i].len() + 1;
+            }
+        }
+
+        if (position.line as usize) < lines.len() {
+            let line = lines[position.line as usize];
+            let char_index = position.character as usize;
+            let mut chars = 0;
+            let mut bytes = 0;
+
+            for c in line.chars() {
+                if chars >= char_index {
+                    break;
+                }
+                bytes += c.len_utf8();
+                chars += 1;
+            }
+
+            byte_index += bytes;
+        }
+
+        byte_index
     }
 }
 

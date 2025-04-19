@@ -44,6 +44,7 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
                         "bazel.build".into(),
@@ -227,6 +228,33 @@ impl LanguageServer for Backend {
 
         let tokens = self.get_semantic_tokens(&text);
         Ok(Some(SemanticTokensRangeResult::Tokens(tokens)))
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let documents = self.documents.read().await;
+        let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
+
+        let formatted_text = self.parser.sort_deps_in_text(&text).map_err(|e| {
+            let mut error =
+                tower_lsp::jsonrpc::Error::new(tower_lsp::jsonrpc::ErrorCode::InternalError);
+            error.data = Some(serde_json::json!({ "message": e.to_string() }));
+            error
+        })?;
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: text.lines().count() as u32,
+                    character: 0,
+                },
+            },
+            new_text: formatted_text,
+        }]))
     }
 }
 
