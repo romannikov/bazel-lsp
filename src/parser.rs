@@ -45,7 +45,7 @@ impl BazelParser {
                     (keyword_argument
                         name: (identifier) @arg_name
                         value: (string) @target_name
-                    )?
+                    ) @first_name
                 )
             )
             "#,
@@ -96,13 +96,16 @@ impl BazelParser {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&self.target_query, tree.root_node(), source.as_bytes());
 
+        let mut processed_rule_calls = std::collections::HashSet::new();
+
         while let Some(m) = matches.next() {
             let mut rule_type = String::new();
             let mut target_name = String::new();
-            let mut start_line = 0;
-            let mut start_char = 0;
-            let mut end_line = 0;
-            let mut end_char = 0;
+            let mut rule_start_line = 0;
+            let mut rule_start_char = 0;
+            let mut rule_end_line = 0;
+            let mut rule_end_char = 0;
+            let mut rule_call_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -110,15 +113,23 @@ impl BazelParser {
 
                 match capture.index {
                     0 => {
-                        // rule_type
                         rule_type = text.to_string();
-                        start_line = node.start_position().row;
-                        start_char = node.start_position().column;
-                        end_line = node.end_position().row;
-                        end_char = node.end_position().column;
+
+                        rule_start_line = node.start_position().row;
+                        rule_start_char = node.start_position().column;
+                        rule_end_line = node.end_position().row;
+                        rule_end_char = node.end_position().column;
+
+                        let mut current = node.parent();
+                        while let Some(parent) = current {
+                            if parent.kind() == "call" {
+                                rule_call_node = Some(parent);
+                                break;
+                            }
+                            current = parent.parent();
+                        }
                     }
                     2 => {
-                        // target_name (if present)
                         if text.starts_with('"') && text.ends_with('"') {
                             target_name = text[1..text.len() - 1].to_string();
                         }
@@ -127,21 +138,28 @@ impl BazelParser {
                 }
             }
 
-            if !rule_type.is_empty() {
-                targets.push(BazelTarget {
-                    name: target_name,
-                    rule_type,
-                    range: Range {
-                        start: Position {
-                            line: start_line as u32,
-                            character: start_char as u32,
-                        },
-                        end: Position {
-                            line: end_line as u32,
-                            character: end_char as u32,
-                        },
-                    },
-                });
+            if let Some(rule_call) = rule_call_node {
+                let rule_call_id = rule_call.id();
+                if !processed_rule_calls.contains(&rule_call_id) {
+                    processed_rule_calls.insert(rule_call_id);
+
+                    if !rule_type.is_empty() && !target_name.is_empty() {
+                        targets.push(BazelTarget {
+                            name: target_name,
+                            rule_type,
+                            range: Range {
+                                start: Position {
+                                    line: rule_start_line as u32,
+                                    character: rule_start_char as u32,
+                                },
+                                end: Position {
+                                    line: rule_end_line as u32,
+                                    character: rule_end_char as u32,
+                                },
+                            },
+                        });
+                    }
+                }
             }
         }
 
