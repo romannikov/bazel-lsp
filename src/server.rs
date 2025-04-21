@@ -123,7 +123,7 @@ impl LanguageServer for Backend {
                     match target.rule_type.as_str() {
                         rule if rule.ends_with("_test") => {
                             lenses.push(CodeLens {
-                                range: target.range.clone(),
+                                range: target.rule_type_range.clone(),
                                 command: None,
                                 data: Some(serde_json::json!({
                                     "type": "test",
@@ -134,7 +134,7 @@ impl LanguageServer for Backend {
                         }
                         rule if rule.ends_with("_binary") => {
                             lenses.push(CodeLens {
-                                range: target.range.clone(),
+                                range: target.rule_type_range.clone(),
                                 command: None,
                                 data: Some(serde_json::json!({
                                     "type": "run",
@@ -146,7 +146,7 @@ impl LanguageServer for Backend {
                         _ => {}
                     }
                     lenses.push(CodeLens {
-                        range: target.range,
+                        range: target.rule_type_range,
                         command: None,
                         data: Some(serde_json::json!({
                             "type": "build",
@@ -380,7 +380,7 @@ impl Backend {
         let mut all_tokens: Vec<(Range, u32)> = Vec::new();
 
         for target in targets {
-            all_tokens.push((target.range, 0));
+            all_tokens.push((target.rule_type_range, 0));
         }
 
         for attr in attributes {

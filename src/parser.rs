@@ -9,6 +9,8 @@ pub struct BazelTarget {
     pub name: String,
     pub rule_type: String,
     pub range: Range,
+    pub rule_type_range: Range,
+    pub rule_call_range: Range,
 }
 
 #[derive(Debug, Clone)]
@@ -114,11 +116,8 @@ impl BazelParser {
         while let Some(m) = matches.next() {
             let mut rule_type = String::new();
             let mut target_name = String::new();
-            let mut rule_start_line = 0;
-            let mut rule_start_char = 0;
-            let mut rule_end_line = 0;
-            let mut rule_end_char = 0;
             let mut rule_call_node = None;
+            let mut rule_type_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -127,12 +126,9 @@ impl BazelParser {
                 match capture.index {
                     0 => {
                         rule_type = text.to_string();
+                        rule_type_node = Some(node);
 
-                        rule_start_line = node.start_position().row;
-                        rule_start_char = node.start_position().column;
-                        rule_end_line = node.end_position().row;
-                        rule_end_char = node.end_position().column;
-
+                        // Find the parent call node which represents the entire target
                         let mut current = node.parent();
                         while let Some(parent) = current {
                             if parent.kind() == "call" {
@@ -157,19 +153,61 @@ impl BazelParser {
                     processed_rule_calls.insert(rule_call_id);
 
                     if !rule_type.is_empty() && !target_name.is_empty() {
+                        // Create the rule type range
+                        let rule_type_range = if let Some(rule_type_node) = rule_type_node {
+                            Range {
+                                start: Position {
+                                    line: rule_type_node.start_position().row as u32,
+                                    character: rule_type_node.start_position().column as u32,
+                                },
+                                end: Position {
+                                    line: rule_type_node.end_position().row as u32,
+                                    character: rule_type_node.end_position().column as u32,
+                                },
+                            }
+                        } else {
+                            // Fallback to the start of the rule call if rule type node is not available
+                            Range {
+                                start: Position {
+                                    line: rule_call.start_position().row as u32,
+                                    character: rule_call.start_position().column as u32,
+                                },
+                                end: Position {
+                                    line: rule_call.start_position().row as u32,
+                                    character: rule_call.start_position().column as u32
+                                        + rule_type.len() as u32,
+                                },
+                            }
+                        };
+
+                        // Create the rule call range (from rule type to closing parenthesis)
+                        let rule_call_range = Range {
+                            start: Position {
+                                line: rule_type_range.start.line,
+                                character: rule_type_range.start.character,
+                            },
+                            end: Position {
+                                line: rule_call.end_position().row as u32,
+                                character: rule_call.end_position().column as u32,
+                            },
+                        };
+
+                        // Use the range of the entire call node instead of just the rule type
                         targets.push(BazelTarget {
                             name: target_name,
                             rule_type,
                             range: Range {
                                 start: Position {
-                                    line: rule_start_line as u32,
-                                    character: rule_start_char as u32,
+                                    line: rule_call.start_position().row as u32,
+                                    character: rule_call.start_position().column as u32,
                                 },
                                 end: Position {
-                                    line: rule_end_line as u32,
-                                    character: rule_end_char as u32,
+                                    line: rule_call.end_position().row as u32,
+                                    character: rule_call.end_position().column as u32,
                                 },
                             },
+                            rule_type_range,
+                            rule_call_range,
                         });
                     }
                 }

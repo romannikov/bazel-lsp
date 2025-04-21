@@ -50,11 +50,11 @@ py_test(
         assert!(!target.name.is_empty(), "Target name is empty");
         assert!(!target.rule_type.is_empty(), "Target rule type is empty");
         assert!(
-            target.range.start.line <= target.range.end.line,
+            target.rule_type_range.start.line <= target.rule_type_range.end.line,
             "Invalid range: start line after end line"
         );
         assert!(
-            target.range.start.character <= target.range.end.character,
+            target.rule_type_range.start.character <= target.rule_type_range.end.character,
             "Invalid range: start character after end character"
         );
     }
@@ -82,13 +82,16 @@ cc_binary(
 
     let target = &targets[0];
 
-    assert_eq!(target.range.start.line, 1, "Expected start line to be 1");
     assert_eq!(
-        target.range.start.character, 0,
+        target.rule_type_range.start.line, 1,
+        "Expected start line to be 1"
+    );
+    assert_eq!(
+        target.rule_type_range.start.character, 0,
         "Expected start character to be 0"
     );
     assert_eq!(
-        target.range.end.character, 9,
+        target.rule_type_range.end.character, 9,
         "Expected end character to be 9"
     );
 
@@ -179,7 +182,7 @@ py_library(
     for target in &targets {
         if target.rule_type.ends_with("_binary") {
             let lens = CodeLens {
-                range: target.range.clone(),
+                range: target.rule_type_range.clone(),
                 command: Some(Command {
                     title: format!("▶ Run {}", target.name),
                     command: "bazel.run".into(),
@@ -194,7 +197,7 @@ py_library(
             has_run_lens = true;
         } else if target.rule_type.ends_with("_test") {
             let lens = CodeLens {
-                range: target.range.clone(),
+                range: target.rule_type_range.clone(),
                 command: Some(Command {
                     title: format!("Test {}", target.name),
                     command: "bazel.test".into(),
@@ -210,7 +213,7 @@ py_library(
         }
 
         let build_lens = CodeLens {
-            range: target.range.clone(),
+            range: target.rule_type_range.clone(),
             command: Some(Command {
                 title: format!("Build {}", target.name),
                 command: "bazel.build".into(),
@@ -272,7 +275,7 @@ py_library(
 
     for (target, (expected_name, expected_type)) in targets.iter().zip(expected_targets.iter()) {
         let build_lens = CodeLens {
-            range: target.range.clone(),
+            range: target.rule_type_range.clone(),
             command: Some(Command {
                 title: format!("Build {}", target.name),
                 command: "bazel.build".into(),
@@ -303,7 +306,7 @@ py_library(
         match target.rule_type.as_str() {
             rule if rule.ends_with("_binary") => {
                 let run_lens = CodeLens {
-                    range: target.range.clone(),
+                    range: target.rule_type_range.clone(),
                     command: Some(Command {
                         title: format!("▶ Run {}", target.name),
                         command: "bazel.run".into(),
@@ -329,7 +332,7 @@ py_library(
             }
             rule if rule.ends_with("_test") => {
                 let test_lens = CodeLens {
-                    range: target.range.clone(),
+                    range: target.rule_type_range.clone(),
                     command: Some(Command {
                         title: format!("Test {}", target.name),
                         command: "bazel.test".into(),

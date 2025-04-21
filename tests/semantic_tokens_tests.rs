@@ -21,7 +21,7 @@ cc_binary(
     assert_eq!(first_target.rule_type, "cc_binary");
 
     // Check that the range has the correct length for "cc_binary"
-    let range_length = first_target.range.end.character - first_target.range.start.character;
+    let range_length = first_target.rule_type_range.end.character - first_target.rule_type_range.start.character;
     assert_eq!(range_length, 9);
 }
 
