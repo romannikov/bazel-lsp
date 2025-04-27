@@ -1,9 +1,6 @@
+use bazel_lsp::server::Backend;
 use tokio::runtime::Runtime;
 use tower_lsp::{LspService, Server};
-
-mod parser;
-mod server;
-use server::Backend;
 
 fn main() {
     let runtime = Runtime::new().unwrap();

@@ -1,4 +1,5 @@
 use crate::parser::BazelParser;
+use crate::target_trie::{RuleInfo, TargetTrie};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,11 +13,23 @@ pub struct Backend {
     pub client: Client,
     parser: BazelParser,
     documents: Arc<RwLock<HashMap<String, String>>>,
+    target_trie: Arc<RwLock<TargetTrie>>,
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        if let Some(workspace_folders) = params.workspace_folders {
+            for folder in workspace_folders {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Workspace folder: {}", folder.uri),
+                    )
+                    .await;
+            }
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -264,6 +277,7 @@ impl Backend {
             client,
             parser: BazelParser::default(),
             documents: Arc::new(RwLock::new(HashMap::new())),
+            target_trie: Arc::new(RwLock::new(TargetTrie::new())),
         }
     }
 
