@@ -1,6 +1,9 @@
+use crate::bazel::{find_build_files, find_workspace_root, is_workspace_dir};
 use crate::parser::BazelParser;
 use crate::target_trie::{RuleInfo, TargetTrie};
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
@@ -11,22 +14,28 @@ use url;
 
 pub struct Backend {
     pub client: Client,
-    parser: BazelParser,
-    documents: Arc<RwLock<HashMap<String, String>>>,
-    target_trie: Arc<RwLock<TargetTrie>>,
+    pub parser: BazelParser,
+    pub documents: Arc<RwLock<HashMap<String, String>>>,
+    pub target_trie: Arc<RwLock<TargetTrie>>,
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        if let Some(workspace_folders) = params.workspace_folders {
+        if let Some(workspace_folders) = &params.workspace_folders {
             for folder in workspace_folders {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Workspace folder: {}", folder.uri),
-                    )
-                    .await;
+                let uri = &folder.uri;
+                let path = uri.to_file_path().unwrap_or_default();
+
+                if let Ok(true) = is_workspace_dir(&path) {
+                    let mut trie = self.target_trie.write().await;
+
+                    let build_files: Vec<PathBuf> = find_build_files(&path).into_iter().collect();
+
+                    for build_file in build_files.iter() {
+                        let _ = self.populate_trie_from_build_file(build_file, &mut trie);
+                    }
+                }
             }
         }
 
@@ -37,6 +46,15 @@ impl LanguageServer for Backend {
                 )),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
+                }),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![':'.into()]),
+                    all_commit_characters: None,
+                    resolve_provider: Some(false),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                    completion_item: None,
                 }),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -269,6 +287,87 @@ impl LanguageServer for Backend {
             new_text: formatted_text,
         }]))
     }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let documents = self.documents.read().await;
+        let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
+
+        let line = text.lines().nth(position.line as usize).unwrap_or("");
+        let line_up_to_cursor = &line[..position.character as usize];
+
+        let last_trigger = if line_up_to_cursor.ends_with("//") {
+            Some(line_up_to_cursor.len() - 2)
+        } else if let Some(pos) = line_up_to_cursor.rfind(':') {
+            Some(pos)
+        } else {
+            None
+        };
+
+        if let Some(trigger_pos) = last_trigger {
+            let text_after_trigger = &line_up_to_cursor[trigger_pos..];
+
+            let trie = self.target_trie.read().await;
+            let matching_rules = trie.starts_with(text_after_trigger);
+
+            let mut completion_items = Vec::new();
+            for rules in matching_rules {
+                for rule in rules {
+                    let edit_text = if text_after_trigger.starts_with("//") {
+                        let slash_count =
+                            text_after_trigger.chars().take_while(|&c| c == '/').count();
+                        if slash_count > 2 {
+                            format!("//{}", &rule.full_build_path[2..])
+                        } else if text_after_trigger.len() > 2 {
+                            let existing_path = &text_after_trigger[2..];
+                            if rule.full_build_path.contains(existing_path) {
+                                if let Some(pos) = rule.full_build_path.find(existing_path) {
+                                    rule.full_build_path[pos..].to_string()
+                                } else {
+                                    rule.full_build_path.clone()
+                                }
+                            } else {
+                                rule.full_build_path.clone()
+                            }
+                        } else {
+                            rule.full_build_path.clone()
+                        }
+                    } else if text_after_trigger.starts_with(':') {
+                        format!(":{}", rule.name)
+                    } else {
+                        rule.full_build_path.clone()
+                    };
+
+                    completion_items.push(CompletionItem {
+                        label: rule.full_build_path.clone(),
+                        kind: Some(CompletionItemKind::TEXT),
+                        detail: Some(format!("Target: {}", rule.full_build_path)),
+                        documentation: Some(Documentation::String(format!(
+                            "Bazel target: {}",
+                            rule.full_build_path
+                        ))),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: trigger_pos as u32,
+                                },
+                                end: position,
+                            },
+                            new_text: edit_text,
+                        })),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            return Ok(Some(CompletionResponse::Array(completion_items)));
+        }
+
+        Ok(None)
+    }
 }
 
 impl Backend {
@@ -373,7 +472,7 @@ impl Backend {
         byte_index
     }
 
-    pub fn get_semantic_tokens(&self, text: &str) -> SemanticTokens {
+    fn get_semantic_tokens(&self, text: &str) -> SemanticTokens {
         let mut tokens = Vec::new();
 
         let targets = match self.parser.extract_targets(text) {
@@ -455,5 +554,43 @@ impl Backend {
             result_id: None,
             data: tokens,
         }
+    }
+
+    fn populate_trie_from_build_file(
+        &self,
+        build_file: &Path,
+        trie: &mut TargetTrie,
+    ) -> anyhow::Result<()> {
+        if let Ok(content) = fs::read_to_string(build_file) {
+            if let Ok(targets) = self.parser.extract_targets(&content) {
+                let package_path = if let Some(workspace_root) = find_workspace_root(build_file)? {
+                    if let Ok(relative_path) =
+                        build_file.parent().unwrap().strip_prefix(workspace_root)
+                    {
+                        relative_path.to_string_lossy().to_string()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                for target in targets {
+                    let full_target_path = if package_path.is_empty() {
+                        target.name.clone()
+                    } else {
+                        format!("{}:{}", package_path, target.name)
+                    };
+
+                    let rule = RuleInfo::new(
+                        target.name.clone(),
+                        format!("//{}:{}", package_path, target.name),
+                    );
+
+                    trie.insert_target(&full_target_path, rule);
+                }
+            }
+        }
+        Ok(())
     }
 }

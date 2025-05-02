@@ -1,5 +1,6 @@
 use anyhow::Result;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Checks if a directory is a Bazel workspace
 ///
@@ -48,4 +49,37 @@ pub fn get_package_path(path: &Path) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// Finds all BUILD files in a directory recursively
+///
+/// This function searches for files named "BUILD" or "BUILD.bazel" in the given directory
+/// and all its subdirectories, excluding hidden directories and bazel-out.
+pub fn find_build_files(dir: &Path) -> Vec<PathBuf> {
+    let mut build_files = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with('.') || name == "bazel-out")
+                    .unwrap_or(false)
+                {
+                    build_files.extend(find_build_files(&path));
+                }
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "BUILD" || name == "BUILD.bazel")
+                .unwrap_or(false)
+            {
+                build_files.push(path);
+            }
+        }
+    }
+
+    build_files
 }

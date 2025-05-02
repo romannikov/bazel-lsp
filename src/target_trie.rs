@@ -3,6 +3,16 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
     pub name: String,
+    pub full_build_path: String,
+}
+
+impl RuleInfo {
+    pub fn new(name: String, full_build_path: String) -> Self {
+        Self {
+            name,
+            full_build_path,
+        }
+    }
 }
 
 #[derive(Debug)]

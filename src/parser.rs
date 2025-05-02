@@ -4,7 +4,7 @@ use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BazelTarget {
     pub name: String,
     pub rule_type: String,

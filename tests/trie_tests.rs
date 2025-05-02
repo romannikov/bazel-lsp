@@ -5,6 +5,7 @@ fn test_trie_insert_and_search() {
     let mut trie = TargetTrie::new();
     let rule = RuleInfo {
         name: "test_rule".to_string(),
+        full_build_path: "//a/b:c".to_string(),
     };
     trie.insert_target("//a/b:c", rule);
 
@@ -18,12 +19,15 @@ fn test_trie_starts_with() {
     let mut trie = TargetTrie::new();
     let rule1 = RuleInfo {
         name: "rule1".to_string(),
+        full_build_path: "//a/b:c".to_string(),
     };
     let rule2 = RuleInfo {
         name: "rule2".to_string(),
+        full_build_path: "//a/b:d".to_string(),
     };
     let rule3 = RuleInfo {
         name: "rule3".to_string(),
+        full_build_path: "//a/c:e".to_string(),
     };
 
     trie.insert_target("//a/b:c", rule1);
@@ -45,6 +49,7 @@ fn test_trie_with_package_path() {
     let mut trie = TargetTrie::new();
     let rule = RuleInfo {
         name: "main".to_string(),
+        full_build_path: "//src:main".to_string(),
     };
     trie.insert_target("//src:main", rule);
 
