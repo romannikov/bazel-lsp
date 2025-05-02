@@ -17,18 +17,23 @@ pub struct Backend {
     pub parser: BazelParser,
     pub documents: Arc<RwLock<HashMap<String, String>>>,
     pub target_trie: Arc<RwLock<TargetTrie>>,
+    pub workspace_folders: Arc<RwLock<Vec<WorkspaceFolder>>>,
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         if let Some(workspace_folders) = &params.workspace_folders {
+            let mut folders = self.workspace_folders.write().await;
+            *folders = workspace_folders.clone();
+
             for folder in workspace_folders {
                 let uri = &folder.uri;
                 let path = uri.to_file_path().unwrap_or_default();
 
                 if let Ok(true) = is_workspace_dir(&path) {
-                    let mut trie = self.target_trie.write().await;
+                    let mut trie: tokio::sync::RwLockWriteGuard<'_, TargetTrie> =
+                        self.target_trie.write().await;
 
                     let build_files: Vec<PathBuf> = find_build_files(&path).into_iter().collect();
 
@@ -295,78 +300,46 @@ impl LanguageServer for Backend {
         let documents = self.documents.read().await;
         let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
 
+        let folders = self.workspace_folders.read().await;
+        let file_path = uri.to_file_path().unwrap_or_default();
+        let is_in_workspace = folders.iter().any(|folder| {
+            if let Ok(folder_path) = folder.uri.to_file_path() {
+                file_path.starts_with(&folder_path)
+            } else {
+                false
+            }
+        });
+
         let line = text.lines().nth(position.line as usize).unwrap_or("");
         let line_up_to_cursor = &line[..position.character as usize];
 
-        let last_trigger = if line_up_to_cursor.ends_with("//") {
-            Some(line_up_to_cursor.len() - 2)
-        } else if let Some(pos) = line_up_to_cursor.rfind(':') {
-            Some(pos)
-        } else {
-            None
-        };
-
-        if let Some(trigger_pos) = last_trigger {
-            let text_after_trigger = &line_up_to_cursor[trigger_pos..];
-
-            let trie = self.target_trie.read().await;
-            let matching_rules = trie.starts_with(text_after_trigger);
-
-            let mut completion_items = Vec::new();
-            for rules in matching_rules {
-                for rule in rules {
-                    let edit_text = if text_after_trigger.starts_with("//") {
-                        let slash_count =
-                            text_after_trigger.chars().take_while(|&c| c == '/').count();
-                        if slash_count > 2 {
-                            format!("//{}", &rule.full_build_path[2..])
-                        } else if text_after_trigger.len() > 2 {
-                            let existing_path = &text_after_trigger[2..];
-                            if rule.full_build_path.contains(existing_path) {
-                                if let Some(pos) = rule.full_build_path.find(existing_path) {
-                                    rule.full_build_path[pos..].to_string()
-                                } else {
-                                    rule.full_build_path.clone()
-                                }
-                            } else {
-                                rule.full_build_path.clone()
-                            }
-                        } else {
-                            rule.full_build_path.clone()
-                        }
-                    } else if text_after_trigger.starts_with(':') {
-                        format!(":{}", rule.name)
-                    } else {
-                        rule.full_build_path.clone()
-                    };
-
-                    completion_items.push(CompletionItem {
-                        label: rule.full_build_path.clone(),
-                        kind: Some(CompletionItemKind::TEXT),
-                        detail: Some(format!("Target: {}", rule.full_build_path)),
-                        documentation: Some(Documentation::String(format!(
-                            "Bazel target: {}",
-                            rule.full_build_path
-                        ))),
-                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                            range: Range {
-                                start: Position {
-                                    line: position.line,
-                                    character: trigger_pos as u32,
-                                },
-                                end: position,
-                            },
-                            new_text: edit_text,
-                        })),
-                        ..Default::default()
-                    });
-                }
-            }
-
-            return Ok(Some(CompletionResponse::Array(completion_items)));
+        let trigger_result = find_trigger_position(line_up_to_cursor);
+        if trigger_result.is_none() {
+            return Ok(None);
         }
 
-        Ok(None)
+        if is_in_workspace {
+            self.completion_in_workspace(position, trigger_result).await
+        } else {
+            self.completion_in_file(trigger_result, &text).await
+        }
+    }
+}
+
+fn create_edit_text_in_workspace<'a>(
+    trigger_result: &Option<TriggerResult<'a>>,
+    rule: &RuleInfo,
+) -> String {
+    if let Some(result) = trigger_result {
+        if result.text_after_trigger.starts_with("//") {
+            rule.full_build_path.clone()
+        } else if result.text_after_trigger.starts_with(':') {
+            format!(":{}", rule.name)
+        } else {
+            rule.full_build_path.clone()
+        }
+    } else {
+        rule.full_build_path.clone()
     }
 }
 
@@ -377,6 +350,7 @@ impl Backend {
             parser: BazelParser::default(),
             documents: Arc::new(RwLock::new(HashMap::new())),
             target_trie: Arc::new(RwLock::new(TargetTrie::new())),
+            workspace_folders: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -592,5 +566,299 @@ impl Backend {
             }
         }
         Ok(())
+    }
+
+    async fn completion_in_file<'a>(
+        &self,
+        trigger_result: Option<TriggerResult<'a>>,
+        text: &str,
+    ) -> Result<Option<CompletionResponse>> {
+        let targets = match self.parser.extract_targets(text) {
+            Ok(targets) => targets,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to extract targets: {}", err),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        let completion_items = match trigger_result {
+            Some(result) => targets
+                .iter()
+                .filter(|t| t.name.starts_with(result.text_after_trigger))
+                .map(|t| CompletionItem {
+                    label: t.name.clone(),
+                    kind: Some(CompletionItemKind::TEXT),
+                    detail: Some(format!("Target: {}", t.name)),
+                    documentation: Some(Documentation::String(format!("Bazel target: {}", t.name))),
+                    ..Default::default()
+                })
+                .collect(),
+            None => vec![],
+        };
+        return Ok(Some(CompletionResponse::Array(completion_items)));
+    }
+
+    async fn completion_in_workspace<'a>(
+        &self,
+        position: Position,
+        trigger_result: Option<TriggerResult<'a>>,
+    ) -> Result<Option<CompletionResponse>> {
+        let trie = self.target_trie.read().await;
+        let matching_rules = match &trigger_result {
+            Some(result) => trie.starts_with(result.text_after_trigger),
+            None => Vec::new(),
+        };
+
+        let mut completion_items = Vec::new();
+        for rules in matching_rules {
+            for rule in rules {
+                let edit_text = create_edit_text_in_workspace(&trigger_result, rule);
+
+                let item = CompletionItem {
+                    label: rule.full_build_path.clone(),
+                    kind: Some(CompletionItemKind::TEXT),
+                    detail: Some(format!("Target: {}", rule.full_build_path)),
+                    documentation: Some(Documentation::String(format!(
+                        "Bazel target: {}",
+                        rule.full_build_path
+                    ))),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: Range {
+                            start: Position {
+                                line: position.line,
+                                character: trigger_result
+                                    .as_ref()
+                                    .map(|r| r.trigger_pos as u32)
+                                    .unwrap_or(0),
+                            },
+                            end: position,
+                        },
+                        new_text: edit_text.clone(),
+                    })),
+                    ..Default::default()
+                };
+                completion_items.push(item);
+            }
+        }
+
+        Ok(Some(CompletionResponse::Array(completion_items)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TriggerType {
+    DoubleSlash,
+    Colon,
+}
+
+#[derive(Debug, PartialEq)]
+struct TriggerResult<'a> {
+    trigger_type: TriggerType,
+    trigger_pos: usize,
+    text_after_trigger: &'a str,
+}
+
+fn find_trigger_position<'a>(line_up_to_cursor: &'a str) -> Option<TriggerResult<'a>> {
+    let trigger_pos = if let Some(quote_pos) = line_up_to_cursor.rfind('"') {
+        let after_quote = &line_up_to_cursor[quote_pos + 1..];
+        if after_quote.len() >= 2
+            && after_quote.as_bytes()[0] == b'/'
+            && after_quote.as_bytes()[1] == b'/'
+        {
+            Some((quote_pos + 1, TriggerType::DoubleSlash, &after_quote[2..]))
+        } else if after_quote.starts_with(':') {
+            Some((quote_pos + 1, TriggerType::Colon, &after_quote[1..]))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    trigger_pos.map(|(pos, trigger_type, text_after)| TriggerResult {
+        trigger_type,
+        trigger_pos: pos,
+        text_after_trigger: text_after,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_double_slash_after_quote() {
+        assert_eq!(
+            find_trigger_position("\"//"),
+            Some(TriggerResult {
+                trigger_type: TriggerType::DoubleSlash,
+                trigger_pos: 1,
+                text_after_trigger: ""
+            })
+        );
+    }
+
+    #[test]
+    fn test_colon_after_quote() {
+        assert_eq!(
+            find_trigger_position("\":"),
+            Some(TriggerResult {
+                trigger_type: TriggerType::Colon,
+                trigger_pos: 1,
+                text_after_trigger: ""
+            })
+        );
+    }
+
+    #[test]
+    fn test_double_slash_with_text_after_quote() {
+        assert_eq!(find_trigger_position("\"foo//"), None);
+    }
+
+    #[test]
+    fn test_colon_with_text_after_quote() {
+        assert_eq!(find_trigger_position("\"foo:"), None);
+    }
+
+    #[test]
+    fn test_colon_without_quote() {
+        assert_eq!(find_trigger_position("foo:"), None);
+    }
+
+    #[test]
+    fn test_empty() {
+        assert_eq!(find_trigger_position(""), None);
+    }
+
+    #[test]
+    fn test_quote_only() {
+        assert_eq!(find_trigger_position("\""), None);
+    }
+
+    #[test]
+    fn test_double_slash_with_text_after_trigger() {
+        assert_eq!(
+            find_trigger_position("\"//somedep"),
+            Some(TriggerResult {
+                trigger_type: TriggerType::DoubleSlash,
+                trigger_pos: 1,
+                text_after_trigger: "somedep"
+            })
+        );
+    }
+
+    #[test]
+    fn test_colon_with_text_after_trigger() {
+        assert_eq!(
+            find_trigger_position("\":somedep"),
+            Some(TriggerResult {
+                trigger_type: TriggerType::Colon,
+                trigger_pos: 1,
+                text_after_trigger: "somedep"
+            })
+        );
+    }
+
+    #[test]
+    fn test_create_edit_text_in_workspace_double_slash() {
+        let trigger_result = Some(TriggerResult {
+            trigger_type: TriggerType::DoubleSlash,
+            trigger_pos: 1,
+            text_after_trigger: "//path/to/target",
+        });
+        let rule = RuleInfo {
+            name: "target".to_string(),
+            full_build_path: "//path/to/target".to_string(),
+        };
+        assert_eq!(
+            create_edit_text_in_workspace(&trigger_result, &rule),
+            "//path/to/target"
+        );
+    }
+
+    #[test]
+    fn test_create_edit_text_in_workspace_colon() {
+        let trigger_result = Some(TriggerResult {
+            trigger_type: TriggerType::Colon,
+            trigger_pos: 1,
+            text_after_trigger: ":target",
+        });
+        let rule = RuleInfo {
+            name: "target".to_string(),
+            full_build_path: "//path/to/target".to_string(),
+        };
+        assert_eq!(
+            create_edit_text_in_workspace(&trigger_result, &rule),
+            ":target"
+        );
+    }
+
+    #[test]
+    fn test_create_edit_text_in_workspace_no_trigger() {
+        let trigger_result = None;
+        let rule = RuleInfo {
+            name: "target".to_string(),
+            full_build_path: "//path/to/target".to_string(),
+        };
+        assert_eq!(
+            create_edit_text_in_workspace(&trigger_result, &rule),
+            "//path/to/target"
+        );
+    }
+
+    #[test]
+    fn test_create_edit_text_in_workspace_multiple_slashes() {
+        let trigger_result = Some(TriggerResult {
+            trigger_type: TriggerType::DoubleSlash,
+            trigger_pos: 1,
+            text_after_trigger: "////path/to/target",
+        });
+        let rule = RuleInfo {
+            name: "target".to_string(),
+            full_build_path: "//path/to/target".to_string(),
+        };
+        assert_eq!(
+            create_edit_text_in_workspace(&trigger_result, &rule),
+            "//path/to/target"
+        );
+    }
+
+    #[test]
+    fn test_create_edit_text_in_workspace_partial_path() {
+        let trigger_result = Some(TriggerResult {
+            trigger_type: TriggerType::DoubleSlash,
+            trigger_pos: 1,
+            text_after_trigger: "//path/to",
+        });
+        let rule = RuleInfo {
+            name: "target".to_string(),
+            full_build_path: "//path/to/target".to_string(),
+        };
+        assert_eq!(
+            create_edit_text_in_workspace(&trigger_result, &rule),
+            "//path/to/target"
+        );
+    }
+
+    #[test]
+    fn test_create_edit_text_in_workspace_path_contained() {
+        let trigger_result = Some(TriggerResult {
+            trigger_type: TriggerType::DoubleSlash,
+            trigger_pos: 1,
+            text_after_trigger: "//to/target",
+        });
+        let rule = RuleInfo {
+            name: "target".to_string(),
+            full_build_path: "//path/to/target".to_string(),
+        };
+        assert_eq!(
+            create_edit_text_in_workspace(&trigger_result, &rule),
+            "//path/to/target"
+        );
     }
 }
