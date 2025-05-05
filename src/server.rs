@@ -581,6 +581,14 @@ impl Backend {
         trigger_result: Option<TriggerResult<'a>>,
         text: &str,
     ) -> Result<Option<CompletionResponse>> {
+        if trigger_result
+            .as_ref()
+            .map(|t| t.trigger_type == TriggerType::DoubleSlash)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+
         let targets = match self.parser.extract_targets(text) {
             Ok(targets) => targets,
             Err(err) => {
@@ -594,21 +602,25 @@ impl Backend {
             }
         };
 
-        let completion_items = match trigger_result {
-            Some(result) => targets
-                .iter()
-                .filter(|t| t.name.starts_with(result.text_after_trigger))
-                .map(|t| CompletionItem {
-                    label: t.name.clone(),
-                    kind: Some(CompletionItemKind::TEXT),
-                    detail: Some(format!("Target: {}", t.name)),
-                    documentation: Some(Documentation::String(format!("Bazel target: {}", t.name))),
-                    ..Default::default()
-                })
-                .collect(),
-            None => vec![],
+        return match trigger_result {
+            Some(result) => Ok(Some(CompletionResponse::Array(
+                targets
+                    .iter()
+                    .filter(|t| t.name.starts_with(result.text_after_trigger))
+                    .map(|t| CompletionItem {
+                        label: t.name.clone(),
+                        kind: Some(CompletionItemKind::TEXT),
+                        detail: Some(format!("Target: {}", t.name)),
+                        documentation: Some(Documentation::String(format!(
+                            "Bazel target: {}",
+                            t.name
+                        ))),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ))),
+            None => Ok(Some(CompletionResponse::Array(vec![]))),
         };
-        return Ok(Some(CompletionResponse::Array(completion_items)));
     }
 
     async fn completion_in_workspace<'a>(
