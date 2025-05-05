@@ -417,6 +417,49 @@ impl BazelParser {
 
         byte_index
     }
+
+    pub fn is_in_deps_attribute(&self, source: &str, position: &Position) -> Result<bool> {
+        let tree = self
+            .parser
+            .lock()
+            .unwrap()
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse BUILD file"))?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.deps_query, tree.root_node(), source.as_bytes());
+
+        Ok(matches.any(|m| {
+            // Find the deps_arg capture (index 2)
+            if let Some(deps_arg) = m.captures.iter().find(|c| c.index == 2) {
+                let node = deps_arg.node;
+                // Check if we're inside the deps argument node
+                let start_line = node.start_position().row as u32;
+                let end_line = node.end_position().row as u32;
+                let start_col = node.start_position().column as u32;
+                let end_col = node.end_position().column as u32;
+
+                // Get the text of the node to count newlines
+                let node_text = &source[node.start_byte()..node.end_byte()];
+                let newlines = node_text.chars().filter(|c| *c == '\n').count() as u32;
+
+                // If we're on the start line, check if we're after the start column
+                // If we're on the end line + newlines, check if we're before the end column
+                // For lines in between, we're always inside
+                if position.line == start_line && position.line == end_line + newlines {
+                    position.character >= start_col && position.character <= end_col
+                } else if position.line == start_line {
+                    position.character >= start_col
+                } else if position.line == end_line + newlines {
+                    position.character <= end_col
+                } else {
+                    position.line > start_line && position.line <= end_line + newlines
+                }
+            } else {
+                false
+            }
+        }))
+    }
 }
 
 impl Default for BazelParser {

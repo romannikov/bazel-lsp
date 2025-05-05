@@ -300,6 +300,14 @@ impl LanguageServer for Backend {
         let documents = self.documents.read().await;
         let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
 
+        if !self
+            .parser
+            .is_in_deps_attribute(&text, &position)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+
         let folders = self.workspace_folders.read().await;
         let file_path = uri.to_file_path().unwrap_or_default();
         let is_in_workspace = folders.iter().any(|folder| {

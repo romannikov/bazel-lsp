@@ -131,3 +131,126 @@ go_library(
     assert_eq!(targets[1].rule_call_range.end.line, 6);
     assert_eq!(targets[1].rule_call_range.end.character, 1);
 }
+
+#[test]
+fn test_is_in_deps_attribute_inside_deps() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib",
+        deps = ["//path/to:target"]
+    )
+    "#;
+    let position = Position {
+        line: 3,
+        character: 20,
+    }; // Inside deps attribute
+    assert!(parser.is_in_deps_attribute(source, &position).unwrap());
+}
+
+#[test]
+fn test_is_in_deps_attribute_inside_target_but_not_deps() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib",
+        deps = ["//path/to:target"]
+    )
+    "#;
+    let position = Position {
+        line: 2,
+        character: 20,
+    }; // Inside name attribute
+    assert!(!parser.is_in_deps_attribute(source, &position).unwrap());
+}
+
+#[test]
+fn test_is_in_deps_attribute_outside_target() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib",
+        deps = ["//path/to:target"]
+    )
+    "#;
+    let position = Position {
+        line: 0,
+        character: 0,
+    }; // Outside any target
+    assert!(!parser.is_in_deps_attribute(source, &position).unwrap());
+}
+
+#[test]
+fn test_is_in_deps_attribute_multiple_targets_first() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib1",
+        deps = ["//path/to:target1"]
+    )
+    cc_library(
+        name = "lib2",
+        deps = ["//path/to:target2"]
+    )
+    "#;
+    let position = Position {
+        line: 3,
+        character: 20,
+    }; // Inside first deps
+    assert!(parser.is_in_deps_attribute(source, &position).unwrap());
+}
+
+#[test]
+fn test_is_in_deps_attribute_multiple_targets_second() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib1",
+        deps = ["//path/to:target1"]
+    )
+    cc_library(
+        name = "lib2",
+        deps = ["//path/to:target2"]
+    )
+    "#;
+    let position = Position {
+        line: 7,
+        character: 20,
+    }; // Inside second deps
+    assert!(parser.is_in_deps_attribute(source, &position).unwrap());
+}
+
+#[test]
+fn test_is_in_deps_attribute_empty_list() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib",
+        deps = []
+    )
+    "#;
+    let position = Position {
+        line: 3,
+        character: 20,
+    }; // Inside empty deps
+    assert!(!parser.is_in_deps_attribute(source, &position).unwrap());
+}
+
+#[test]
+fn test_is_in_deps_attribute_multiple_items() {
+    let parser = BazelParser::new().unwrap();
+    let source = r#"
+    cc_library(
+        name = "lib",
+        deps = [
+            "//path/to:target1",
+            "//path/to:target2"
+        ]
+    )
+    "#;
+    let position = Position {
+        line: 4,
+        character: 20,
+    }; // Inside deps list
+    assert!(parser.is_in_deps_attribute(source, &position).unwrap());
+}
