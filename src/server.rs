@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::io::AsyncReadExt;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::SemanticTokensOptions;
 use tower_lsp::lsp_types::*;
@@ -50,7 +51,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
                 code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: Some(true),
+                    resolve_provider: Some(false),
                 }),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![':'.into()]),
@@ -86,7 +87,6 @@ impl LanguageServer for Backend {
                         "bazel.build".into(),
                         "bazel.test".into(),
                         "bazel.run".into(),
-                        "bazel.execute".into(),
                     ],
                     work_done_progress_options: WorkDoneProgressOptions {
                         work_done_progress: Some(true),
@@ -153,42 +153,77 @@ impl LanguageServer for Backend {
 
         let mut lenses = Vec::new();
 
+        let file_path = uri.to_file_path().unwrap_or_default();
+        let workspace_folders = self.workspace_folders.read().await;
+        let workspace_root = workspace_folders
+            .iter()
+            .find_map(|folder| {
+                let path = folder.uri.to_file_path().ok()?;
+                if is_workspace_dir(&path).unwrap_or(false) {
+                    Some(path)
+                } else {
+                    None
+                }
+            });
+
+        let package_path = if let Some(workspace_root) = workspace_root {
+            if let Ok(relative_path) = file_path.parent().unwrap().strip_prefix(&workspace_root) {
+                relative_path.to_string_lossy().to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         match self.parser.extract_targets(&text) {
             Ok(targets) => {
                 for target in targets {
+                    let full_target_path = if package_path.is_empty() {
+                        format!("//:{}", target.name)
+                    } else {
+                        format!("//{}:{}", package_path, target.name)
+                    };
+
                     match target.rule_type.as_str() {
                         rule if rule.ends_with("_test") => {
                             lenses.push(CodeLens {
                                 range: target.rule_type_range.clone(),
-                                command: None,
-                                data: Some(serde_json::json!({
-                                    "type": "test",
-                                    "target": target.name,
-                                    "rule_type": target.rule_type,
-                                })),
+                                command: Some(Command {
+                                    title: format!("Test {}", target.name),
+                                    command: "bazel.test".into(),
+                                    arguments: Some(vec![serde_json::json!({
+                                        "target": full_target_path
+                                    })]),
+                                }),
+                                data: None,
                             });
                         }
                         rule if rule.ends_with("_binary") => {
                             lenses.push(CodeLens {
                                 range: target.rule_type_range.clone(),
-                                command: None,
-                                data: Some(serde_json::json!({
-                                    "type": "run",
-                                    "target": target.name,
-                                    "rule_type": target.rule_type,
-                                })),
+                                command: Some(Command {
+                                    title: format!("▶ Run {}", target.name),
+                                    command: "bazel.run".into(),
+                                    arguments: Some(vec![serde_json::json!({
+                                        "target": full_target_path
+                                    })]),
+                                }),
+                                data: None,
                             });
                         }
                         _ => {}
                     }
                     lenses.push(CodeLens {
                         range: target.rule_type_range,
-                        command: None,
-                        data: Some(serde_json::json!({
-                            "type": "build",
-                            "target": target.name,
-                            "rule_type": target.rule_type,
-                        })),
+                        command: Some(Command {
+                            title: format!("Build {}", target.name),
+                            command: "bazel.build".into(),
+                            arguments: Some(vec![serde_json::json!({
+                                "target": full_target_path
+                            })]),
+                        }),
+                        data: None,
                     });
                 }
             }
@@ -205,42 +240,7 @@ impl LanguageServer for Backend {
         Ok(Some(lenses))
     }
 
-    async fn code_lens_resolve(&self, lens: CodeLens) -> Result<CodeLens> {
-        let data = lens.data.clone().unwrap();
-        let lens_type = data["type"].as_str().unwrap();
-        let target = data["target"].as_str().unwrap();
 
-        let command = match lens_type {
-            "run" => Command {
-                title: format!("▶ Run {}", target),
-                command: "bazel.run".into(),
-                arguments: Some(vec![serde_json::json!({
-                    "target": target
-                })]),
-            },
-            "test" => Command {
-                title: format!("Test {}", target),
-                command: "bazel.test".into(),
-                arguments: Some(vec![serde_json::json!({
-                    "target": target
-                })]),
-            },
-            "build" => Command {
-                title: format!("Build {}", target),
-                command: "bazel.build".into(),
-                arguments: Some(vec![serde_json::json!({
-                    "target": target
-                })]),
-            },
-            _ => panic!("Unknown lens type: {}", lens_type),
-        };
-
-        Ok(CodeLens {
-            range: lens.range,
-            command: Some(command),
-            data: lens.data,
-        })
-    }
 
     async fn semantic_tokens_full(
         &self,
@@ -330,6 +330,57 @@ impl LanguageServer for Backend {
             self.completion_in_workspace(position, trigger_result).await
         } else {
             self.completion_in_file(trigger_result, &text).await
+        }
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<serde_json::Value>> {
+        match params.command.as_str() {
+            "bazel.build" => {
+                if let Some(target) = params.arguments.get(0) {
+                    if let Some(target_obj) = target.as_object() {
+                        if let Some(target_name) = target_obj.get("target") {
+                            if let Some(target_str) = target_name.as_str() {
+                                self.execute_bazel_command("build", target_str).await;
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "bazel.test" => {
+                if let Some(target) = params.arguments.get(0) {
+                    if let Some(target_obj) = target.as_object() {
+                        if let Some(target_name) = target_obj.get("target") {
+                            if let Some(target_str) = target_name.as_str() {
+                                self.execute_bazel_command("test", target_str).await;
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "bazel.run" => {
+                if let Some(target) = params.arguments.get(0) {
+                    if let Some(target_obj) = target.as_object() {
+                        if let Some(target_name) = target_obj.get("target") {
+                            if let Some(target_str) = target_name.as_str() {
+                                self.execute_bazel_command("run", target_str).await;
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
+            _ => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Unknown command: {}", params.command),
+                    )
+                    .await;
+                Ok(None)
+            }
         }
     }
 }
@@ -667,6 +718,130 @@ impl Backend {
         }
 
         Ok(Some(CompletionResponse::Array(completion_items)))
+    }
+
+    async fn execute_bazel_command(&self, command: &str, target: &str) {
+        let workspace_folders = self.workspace_folders.read().await;
+        let workspace_root = workspace_folders
+            .iter()
+            .find_map(|folder| {
+                let path = folder.uri.to_file_path().ok()?;
+                if is_workspace_dir(&path).unwrap_or(false) {
+                    Some(path)
+                } else {
+                    None
+                }
+            });
+
+        let command_str = format!("bazel {} {}", command, target);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Executing: {} (from workspace: {:?})", command_str, workspace_root),
+            )
+            .await;
+
+        let mut cmd = tokio::process::Command::new("bazel");
+        cmd.arg(command).arg(target);
+        
+        if let Some(workspace_path) = workspace_root {
+            cmd.current_dir(workspace_path);
+        }
+
+        // Use spawn to get real-time output
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to spawn bazel {} for {}: {}", command, target, e),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        // Spawn tasks to read stdout and stderr in real-time
+        let client_stdout = self.client.clone();
+        let client_stderr = self.client.clone();
+
+        let stdout_task = async move {
+            if let Some(mut stdout) = stdout {
+                let mut buffer = [0; 1024];
+                loop {
+                    match stdout.read(&mut buffer).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            client_stdout
+                                .log_message(MessageType::INFO, output.to_string())
+                                .await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        };
+
+        let stderr_task = async move {
+            if let Some(mut stderr) = stderr {
+                let mut buffer = [0; 1024];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            client_stderr
+                                .log_message(MessageType::ERROR, output.to_string())
+                                .await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        };
+
+        // Run both tasks concurrently
+        let (_, _) = tokio::join!(stdout_task, stderr_task);
+
+        // Wait for the process to finish
+        match child.wait().await {
+            Ok(status) => {
+                if status.success() {
+                    let success_msg = match command {
+                        "build" => format!("Successfully built target: {}", target),
+                        "test" => format!("Successfully tested target: {}", target),
+                        "run" => format!("Successfully ran target: {}", target),
+                        _ => format!("Successfully executed bazel {} for target: {}", command, target),
+                    };
+                    self.client
+                        .log_message(MessageType::INFO, success_msg)
+                        .await;
+                } else {
+                    let error_msg = match command {
+                        "build" => format!("Failed to build target {} (exit code: {})", target, status),
+                        "test" => format!("Failed to test target {} (exit code: {})", target, status),
+                        "run" => format!("Failed to run target {} (exit code: {})", target, status),
+                        _ => format!("Failed to execute bazel {} for target {} (exit code: {})", command, target, status),
+                    };
+                    self.client
+                        .log_message(MessageType::ERROR, error_msg)
+                        .await;
+                }
+            }
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to wait for bazel {} for {}: {}", command, target, e),
+                    )
+                    .await;
+            }
+        }
     }
 }
 
