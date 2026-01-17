@@ -1,4 +1,4 @@
-use crate::bazel::{find_build_files, find_workspace_root, is_workspace_dir};
+use crate::bazel::{find_build_files, find_workspace_root, is_workspace_dir, parse_label, resolve_label_path};
 use crate::parser::BazelParser;
 use crate::target_trie::{RuleInfo, TargetTrie};
 use std::collections::HashMap;
@@ -81,6 +81,7 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                definition_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
@@ -382,6 +383,89 @@ impl LanguageServer for Backend {
                 Ok(None)
             }
         }
+    }
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let documents = self.documents.read().await;
+        let text = documents.get(&uri.to_string()).cloned().unwrap_or_default();
+
+        let line = text.lines().nth(position.line as usize).unwrap_or("");
+        
+        // Simple heuristic: find string at cursor
+        // This is a bit naive, ideally we use tree-sitter, but for now specific regex or simple search
+        // Find the "word" or string literal at cursor position
+        
+        let chars: Vec<char> = line.chars().collect();
+        if position.character as usize >= chars.len() {
+             return Ok(None);
+        }
+
+        // Search backwards for quote
+        let mut start_idx = None;
+        for i in (0..=position.character as usize).rev() {
+            if chars[i] == '"' || chars[i] == '\'' {
+                start_idx = Some(i);
+                break;
+            }
+        }
+
+        // Search forwards for quote
+        let mut end_idx = None;
+        for i in position.character as usize..chars.len() {
+            if chars[i] == '"' || chars[i] == '\'' {
+                end_idx = Some(i);
+                break;
+            }
+        }
+
+        if let (Some(start), Some(end)) = (start_idx, end_idx) {
+            // Check if it's the same quote type and we are inside
+            if chars[start] == chars[end] {
+                let content: String = chars[start+1..end].iter().collect();
+                
+                if let Some(label) = parse_label(&content) {
+                    let file_path = uri.to_file_path().unwrap_or_default();
+                    
+                    // We need workspace root
+                    let folders = self.workspace_folders.read().await;
+                    let workspace_root = folders
+                        .iter()
+                        .find_map(|folder| {
+                            let path = folder.uri.to_file_path().ok()?;
+                            if is_workspace_dir(&path).unwrap_or(false) {
+                                Some(path)
+                            } else {
+                                None
+                            }
+                        });
+
+
+                    if let Some(root) = workspace_root {
+                         if let Ok(Some((build_file, target_name))) = resolve_label_path(&label, &file_path, &root) {
+                             // Now parse the build file to find the target location
+                             if let Ok(content) = fs::read_to_string(&build_file) {
+                                 if let Ok(targets) = self.parser.extract_targets(&content) {
+                                     if let Some(target) = targets.iter().find(|t| t.name == target_name) {
+                                         let target_uri = Url::from_file_path(&build_file).unwrap();
+                                         return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                             uri: target_uri,
+                                             range: target.rule_call_range,
+                                         })));
+                                     }
+                                 }
+                             }
+                         }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
