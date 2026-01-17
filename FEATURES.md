@@ -1,39 +1,56 @@
-# Bazel LSP Feature Proposal
+# Bazel LSP Features
 
-Based on the project review, the following standard LSP features are proposed for implementation to enhance the IDE experience.
+## Implemented Features
 
-## 1. Go to Definition (`textDocument/definition`)
+### 1. Go to Definition (`textDocument/definition`)
 **Goal**: Allow users to jump to the definition of a Bazel target from a label string.
-
 -   **Functionality**:
     -   Detect if the cursor is on a Bazel label (e.g., `//pkg:target` or `:target`).
-    -   **Local Targets** (`:name`): parsing the current file to find the rule definition.
-    -   **Global Targets** (`//pkg:name` or `@repo//pkg:name`):
-        -   Resolve the workspace root.
-        -   Locate the specific `BUILD` or `BUILD.bazel` file in the package.
-        -   Parse the target file to find the rule location.
--   **Implementation Details**:
-    -   Reuse `BazelParser` to parse destination files.
-    -   Implement logic to resolve labels to file paths.
+    -   **Local Targets**: Jumps to the rule definition in the current file.
+    -   **Global Targets**: Jumps to the `BUILD` file and rule definition in the referenced package.
 
-## 2. Hover (`textDocument/hover`)
+### 2. Auto-Completion (`textDocument/completion`)
+**Goal**: Assist in writing Bazel labels.
+-   **Functionality**:
+    -   Triggered by `:`.
+    -   **Workspace Completion**: Suggests targets across the workspace when typing `//`.
+    -   **Local Completion**: Suggests targets in the current file when typing `:`.
+
+### 3. Code Lens (`textDocument/codeLens`)
+**Goal**: Provide quick actions for runnable targets.
+-   **Functionality**:
+    -   presents "Build", "Run", or "Test" lenses above `cc_library`, `cc_binary`, `cc_test` and similar rules.
+    -   Executes the corresponding `bazel` command in the background.
+
+### 4. Semantic Highlighting (`textDocument/semanticTokens`)
+**Goal**: Improve code readability.
+-   **Functionality**:
+    -   Highlights rule names (functions), attributes (keys), and string values.
+
+### 5. Formatting (`textDocument/formatting`)
+**Goal**: Keep `BUILD` files tidy.
+-   **Functionality**:
+    -   Sorts dependencies in `deps = [...]` lists alphabetically.
+
+### 6. Execute Command (`workspace/executeCommand`)
+**Goal**: Server-side execution of Bazel tasks.
+-   **Functionality**:
+    -   `bazel.build`: Builds a target.
+    -   `bazel.run`: Runs a binary target.
+    -   `bazel.test`: Runs a test target.
+
+---
+
+## Future Features
+
+### 1. Hover (`textDocument/hover`)
 **Goal**: Display information about a target when hovering over its label.
+-   **Idea**: Show Rule Type and Fully Qualified Label.
 
--   **Functionality**:
-    -   Show the **Rule Type** (e.g., `cc_library`, `java_binary`).
-    -   Show the **Fully Qualified Label** (e.g., `//my/pkg:my_target`).
-    -   (Optional) Show documentation strings or attributes if available.
--   **Implementation Details**:
-    -   Use the same label resolution logic as "Go to Definition".
-    -   Extract rule type from the parsed AST of the definition.
-
-## 3. Document Symbols (`textDocument/documentSymbol`)
+### 2. Document Symbols (`textDocument/documentSymbol`)
 **Goal**: Provide a high-level outline of the current `BUILD` file.
+-   **Idea**: List all targets in the "Outline" view for quick navigation.
 
--   **Functionality**:
-    -   List all top-level targets (rules) in the file.
-    -   Show their names and types.
-    -   Allow quick navigation via the "Outline" view in the IDE.
--   **Implementation Details**:
-    -   Use `parser.extract_targets` to get the list of targets.
-    -   Map `BazelTarget` structs to `SymbolInformation` or `DocumentSymbol` LSP types.
+### 3. Diagnostics (`textDocument/publishDiagnostics`)
+**Goal**: Show errors and warnings.
+-   **Idea**: Integrate with `bazel analyze` or Starlark linter to show build errors inline.
